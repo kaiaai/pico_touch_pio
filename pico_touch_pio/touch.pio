@@ -1,0 +1,78 @@
+; Copyright 2023-2024 REMAKE.AI, KAIA.AI, MAKERSPET.COM
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+
+.program touchsense
+
+PUBLIC begin:
+;    pull block              ; wait for the timeout value
+    set x 25                ; Init precharge timer count OSR := 25*2^12
+    mov OSR x
+    out NULL 12
+
+.wrap_target                ; repeat (1) pre-charge GPIO (2) let GPIO discharge slowly
+    set pindirs, 1          ; set GPIO as output to start pre-charge
+	set pins, 1             ; drive GPIO high
+    mov x OSR
+precharge_loop:             ; pre-charge GPIO
+    jmp x-- precharge_loop  ; delay
+    set pindirs, 0          ; set GPIO as input to start discharge
+    set x, 0                ; reset time counter to -1
+    mov x, !x            ;
+discharge_loop:
+    jmp x--, x_not_zero     ; decrement time counter
+	jmp timeout             ; timeout
+x_not_zero:
+    jmp pin, discharge_loop ; loop until discharged
+timeout:
+    mov isr, x              ; output time counter result
+    push noblock            ;
+.wrap
+
+% c-sdk {
+// This is a raw helper function for use by the user which sets up the GPIO output,
+// and configures the SM to output on a particular pin
+static inline void touchsense_program_init(PIO pio, uint sm, uint offset, uint touch_pin) {
+  gpio_pull_down(touch_pin); // Enable pull-down
+  //gpio_put(touch_pin, 1); // Drive GPIO high when output
+  //gpio_set_dir(touch_pin, GPIO_OUT); // Set GPIO as output for now
+
+  pio_sm_set_enabled(pio, sm, false); // Stop the state machine
+  pio_sm_clear_fifos(pio, sm);   // Clear all FIFOs
+  pio_sm_restart(pio, sm);
+
+  pio_gpio_init(pio, touch_pin); // Connect GPIO to PIO
+  pio_sm_set_consecutive_pindirs(pio, sm, touch_pin, 1, true); // Set GPIO as output
+
+  pio_sm_config c = touchsense_program_get_default_config(offset);
+  sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+  // hw_set_bits(&pio->sm[sm].shiftctrl, PIO_SM0_SHIFTCTRL_OUT_SHIFTDIR_BITS);
+  sm_config_set_out_shift (&c, false, false, 32); // shift OSR left
+  
+  // Associate touch_pin with the 'in' instructions
+  sm_config_set_in_pins(&c, touch_pin);
+
+  // Associate touch_pin with 'jmp' instructions
+  sm_config_set_jmp_pin(&c, touch_pin);
+
+  // Associate touch_pin with 'set' instructions
+  sm_config_set_set_pins(&c, touch_pin, 1);
+  
+  // Associate touch_pin with 'out' and sideset instructions
+  sm_config_set_sideset_pins(&c, touch_pin);
+
+  // Load the PIO program
+  pio_sm_init(pio, sm, offset, &c);
+}
+%}
